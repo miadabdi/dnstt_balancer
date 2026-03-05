@@ -1,0 +1,2 @@
+# dnstt-balancer dependencies
+# Currently uses only Python standard library — no third-party packages required.
