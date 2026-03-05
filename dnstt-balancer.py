@@ -1066,13 +1066,16 @@ def _fmt_rate(bps: float) -> str:
 
 
 def _fmt_age(seconds: float) -> str:
-    """Compact age display: 5m02s or 2h31m."""
+    """Compact age display that fits within 7 chars: 5m02s, 59m59s, 2h31m, 10h5m."""
     if seconds < 3600:
         m, s = divmod(int(seconds), 60)
         return f"{m}m{s:02d}s"
     h, rem = divmod(int(seconds), 3600)
     m, _ = divmod(rem, 60)
-    return f"{h}h{m:02d}m"
+    if h < 100:
+        return f"{h}h{m:02d}m"
+    d, h2 = divmod(h, 24)
+    return f"{d}d{h2:02d}h"
 
 
 def _fmt_uptime(seconds: float) -> str:
@@ -1095,9 +1098,9 @@ class Dashboard:
         ("Act", 3, ">"),
         ("Up", 7, ">"),
         ("Down", 7, ">"),
-        ("Age", 5, ">"),
+        ("Age", 7, ">"),
     ]
-    _FIXED_WIDTH_SUM = sum(w for _, w, _ in _COLS_FIXED)  # 41
+    _FIXED_WIDTH_SUM = sum(w for _, w, _ in _COLS_FIXED)  # 43
 
     def __init__(
         self,
@@ -1215,8 +1218,8 @@ class Dashboard:
 
         # Dynamic DNS column width:
         # inner = W-4, col separators "  "*8 = 16
-        # dns_w = inner - 16 - fixed_sum = W - 4 - 16 - 41 = W - 61
-        dns_w = max(16, W - 61)
+        # dns_w = inner - 16 - fixed_sum = W - 4 - 16 - 43 = W - 63
+        dns_w = max(16, W - 63)
 
         # Build ordered column specs with DNS inserted after #
         col_specs: List[Tuple[str, int, str]] = [self._COLS_FIXED[0]]
@@ -1226,7 +1229,7 @@ class Dashboard:
 
         S = _S
         out: List[str] = []
-        out.append("\033[2J\033[H")  # clear + home
+        out.append("\033[H")  # cursor home (no clear — we overwrite in place)
 
         # ── Top border ──
         out.append(self._hline(W, _TL, _TR))
@@ -1317,7 +1320,7 @@ class Dashboard:
                 (act, 3, ">"),
                 (_fmt_bytes(t.stats.bytes_tx), 7, ">"),
                 (_fmt_bytes(t.stats.bytes_rx), 7, ">"),
-                (age, 5, ">"),
+                (age, 7, ">"),
             ]
             out.append(self._table_row(cells, W))
 
@@ -1343,6 +1346,15 @@ class Dashboard:
         foot = f"{S.DIM}Ctrl+C to exit    Refresh: {self.interval:.0f}s{S.RESET}"
         out.append(self._row(foot, W))
         out.append(self._hline(W, _BL, _BR))
+
+        # Pad with blank lines to fill the terminal and erase any leftover
+        try:
+            term_h = shutil.get_terminal_size().lines
+        except Exception:
+            term_h = 40
+        drawn = len(out) - 1  # first entry is just the \033[H escape
+        for _ in range(max(0, term_h - drawn - 1)):
+            out.append(" " * W)
 
         sys.stdout.write("\n".join(out) + "\n")
         sys.stdout.flush()
@@ -1394,7 +1406,7 @@ class DnsttBalancer:
                 self.pool,
                 self.socks_server,
                 self.ring_handler,
-                interval=args.stats_interval,
+                interval=args.tui_interval,
                 listen_addr=args.listen,
             )
 
@@ -1661,10 +1673,12 @@ Example:
         help="Seconds between retrying dead resolvers (default: 300 = 5min)",
     )
     p.add_argument(
+        "--tui-interval",
         "--stats-interval",
+        dest="tui_interval",
         type=float,
-        default=5.0,
-        help="Dashboard refresh interval in seconds (default: 5.0)",
+        default=2.0,
+        help="Dashboard refresh interval in seconds (default: 2.0)",
     )
     p.add_argument(
         "--no-dashboard",
