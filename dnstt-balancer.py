@@ -60,7 +60,6 @@ SOCKS5_REP_HOST_UNREACH = 0x04
 SOCKS5_REP_REFUSED = 0x05
 SOCKS5_REP_CMD_NOT_SUPPORTED = 0x07
 
-BASE_PORT = 30000
 RELAY_BUF = 65536  # 64KB relay buffer
 HEALTH_TARGET_HOST = "www.gstatic.com"
 HEALTH_TARGET_PORT = 443
@@ -68,8 +67,16 @@ MAX_CONSECUTIVE_FAILURES = 3
 MAX_RETRIES = 2  # retry on different tunnel if upstream connect fails
 NO_TUNNEL_WAIT = 3.0  # seconds to wait if no healthy tunnel, before giving up
 NO_TUNNEL_POLL = 0.3  # poll interval while waiting for a tunnel
+EWMA_ALPHA = 0.3  # weight for new latency samples (higher = more responsive)
 
 logger = logging.getLogger("dnstt-balancer")
+
+
+def _get_free_port() -> int:
+    """Ask the OS for a free TCP port on 127.0.0.1."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 # ─── Ring-buffer log handler for dashboard ────────────────────────────────────
@@ -113,6 +120,7 @@ class DnsttTunnel:
     process: Optional[subprocess.Popen] = None
     healthy: bool = False
     latency: float = float("inf")
+    latency_ewma: float = float("inf")
     stats: TunnelStats = field(default_factory=TunnelStats)
     started_at: float = 0.0
     last_health_check: float = 0.0
@@ -203,7 +211,7 @@ class TunnelPool:
         self, tunnel_id: int, dns_server: str
     ) -> Optional[DnsttTunnel]:
         """Spawn a single dnstt-client process and wait for its SOCKS port."""
-        socks_port = BASE_PORT + tunnel_id
+        socks_port = _get_free_port()
         stderr_path = os.path.join(
             tempfile.gettempdir(), f"dnstt_balancer_{tunnel_id}.log"
         )
@@ -332,7 +340,7 @@ class TunnelPool:
 
         weights = []
         for t in healthy:
-            lat = t.latency if t.latency < float("inf") else 5.0
+            lat = t.latency_ewma if t.latency_ewma < float("inf") else 5.0
             w = 1.0 / (max(lat, 0.01) * (1 + t.stats.active_connections))
             weights.append(w)
 
@@ -350,7 +358,7 @@ class TunnelPool:
 
         weights = []
         for t in candidates:
-            lat = t.latency if t.latency < float("inf") else 5.0
+            lat = t.latency_ewma if t.latency_ewma < float("inf") else 5.0
             w = 1.0 / (max(lat, 0.01) * (1 + t.stats.active_connections))
             weights.append(w)
 
@@ -446,16 +454,33 @@ class TunnelPool:
             )
 
     async def stop_all(self):
-        """Kill all dnstt-client processes."""
+        """Kill all dnstt-client processes (in parallel via thread pool)."""
+        loop = asyncio.get_event_loop()
+        tasks = []
         for tunnel in list(self.tunnels.values()):
             if tunnel.process and tunnel.is_alive():
-                self._kill_process(tunnel.process)
+                tasks.append(
+                    loop.run_in_executor(None, self._kill_process, tunnel.process)
+                )
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        for tunnel in list(self.tunnels.values()):
             try:
                 os.unlink(tunnel.stderr_path)
             except Exception:
                 pass
         self.tunnels.clear()
         logger.info("All tunnels stopped")
+
+    def force_kill_all(self):
+        """Synchronous best-effort kill of every tunnel process (no waiting)."""
+        for tunnel in list(self.tunnels.values()):
+            try:
+                if tunnel.process and tunnel.process.poll() is None:
+                    tunnel.process.kill()
+            except Exception:
+                pass
+        self.tunnels.clear()
 
 
 # ─── SOCKS5 Protocol Helpers ─────────────────────────────────────────────────
@@ -534,10 +559,17 @@ async def socks5_read_reply_addr(
 class Socks5Server:
     """Async SOCKS5 proxy that distributes connections across dnstt tunnels."""
 
-    def __init__(self, pool: TunnelPool, listen_host: str, listen_port: int):
+    def __init__(
+        self,
+        pool: TunnelPool,
+        listen_host: str,
+        listen_port: int,
+        idle_timeout: float = 120.0,
+    ):
         self.pool = pool
         self.listen_host = listen_host
         self.listen_port = listen_port
+        self.idle_timeout = idle_timeout
         self.server: Optional[asyncio.AbstractServer] = None
         self.total_connections = 0
         self.active_connections = 0
@@ -793,13 +825,22 @@ class Socks5Server:
         u_writer: asyncio.StreamWriter,
         tunnel: DnsttTunnel,
     ):
-        """Bidirectional data relay between client and upstream tunnel."""
+        """Bidirectional data relay between client and upstream tunnel.
+
+        A shared ``last_activity`` timestamp is updated whenever data moves
+        in *either* direction.  A watchdog coroutine kills the relay when
+        nothing has moved for ``idle_timeout`` seconds — this detects
+        stalled tunnels so the client can reconnect through a healthier one.
+        """
+        idle_timeout = self.idle_timeout
+        last_activity = time.time()
 
         async def pipe(
             reader: asyncio.StreamReader,
             writer: asyncio.StreamWriter,
             direction: str,
         ):
+            nonlocal last_activity
             try:
                 while True:
                     data = await reader.read(RELAY_BUF)
@@ -807,6 +848,7 @@ class Socks5Server:
                         break
                     writer.write(data)
                     await writer.drain()
+                    last_activity = time.time()
                     if direction == "tx":
                         tunnel.stats.bytes_tx += len(data)
                     else:
@@ -819,11 +861,23 @@ class Socks5Server:
             ):
                 pass
 
+        async def watchdog():
+            """Cancel relay when no data moves for idle_timeout seconds."""
+            while True:
+                await asyncio.sleep(min(idle_timeout / 4, 15))
+                if time.time() - last_activity > idle_timeout:
+                    logger.debug(
+                        f"Stall detected on tunnel #{tunnel.tunnel_id} "
+                        f"(idle >{idle_timeout:.0f}s), closing connection"
+                    )
+                    return  # returning causes FIRST_COMPLETED to fire
+
         t1 = asyncio.create_task(pipe(c_reader, u_writer, "tx"))
         t2 = asyncio.create_task(pipe(u_reader, c_writer, "rx"))
+        t3 = asyncio.create_task(watchdog())
 
         done, pending = await asyncio.wait(
-            {t1, t2}, return_when=asyncio.FIRST_COMPLETED
+            {t1, t2, t3}, return_when=asyncio.FIRST_COMPLETED
         )
         for task in pending:
             task.cancel()
@@ -852,10 +906,12 @@ class HealthMonitor:
         pool: TunnelPool,
         interval: float = 30.0,
         revive_interval: float = 300.0,
+        recycle_age: float = 0,
     ):
         self.pool = pool
         self.interval = interval
         self.revive_interval = revive_interval
+        self.recycle_age = recycle_age  # 0 = disabled
         self._task: Optional[asyncio.Task] = None
 
     def start(self):
@@ -892,6 +948,10 @@ class HealthMonitor:
                     and self.pool.reserve_resolvers
                 ):
                     await self.pool.fill_up()
+
+                # Recycle tunnels that have exceeded max age
+                if self.recycle_age > 0:
+                    await self._recycle_old_tunnels()
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -902,6 +962,29 @@ class HealthMonitor:
         tunnels = list(self.pool.tunnels.values())
         tasks = [self._check_one(t) for t in tunnels]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _recycle_old_tunnels(self):
+        """Replace tunnels that have exceeded recycle_age seconds."""
+        now = time.time()
+        for tunnel in list(self.pool.tunnels.values()):
+            if tunnel.started_at <= 0:
+                continue
+            age = now - tunnel.started_at
+            if age < self.recycle_age:
+                continue
+            # Skip if tunnel has active connections (let them finish)
+            if tunnel.stats.active_connections > 0:
+                logger.debug(
+                    f"Tunnel #{tunnel.tunnel_id} age {age:.0f}s exceeds "
+                    f"recycle limit but has {tunnel.stats.active_connections} "
+                    f"active connections, deferring"
+                )
+                continue
+            logger.info(
+                f"Recycling tunnel #{tunnel.tunnel_id} ({tunnel.dns_server}) "
+                f"after {age:.0f}s"
+            )
+            await self.pool.replace_tunnel(tunnel)
 
     async def _check_one(self, tunnel: DnsttTunnel):
         """Check a single tunnel's health by doing a SOCKS5 CONNECT probe."""
@@ -960,6 +1043,12 @@ class HealthMonitor:
 
             if rep == SOCKS5_REP_SUCCESS:
                 tunnel.latency = elapsed
+                if tunnel.latency_ewma == float("inf"):
+                    tunnel.latency_ewma = elapsed
+                else:
+                    tunnel.latency_ewma = (
+                        EWMA_ALPHA * elapsed + (1 - EWMA_ALPHA) * tunnel.latency_ewma
+                    )
                 tunnel.healthy = True
                 tunnel.consecutive_failures = 0
                 tunnel.last_health_check = time.time()
@@ -1285,14 +1374,15 @@ class Dashboard:
             else:
                 health = f"{S.RED}\u25cb --{S.RESET}"
 
-            # Latency (color-coded)
-            if t.latency < float("inf"):
-                if t.latency < 2.0:
-                    lat = f"{S.GREEN}{t.latency:.1f}s{S.RESET}"
-                elif t.latency < 5.0:
-                    lat = f"{S.YELLOW}{t.latency:.1f}s{S.RESET}"
+            # Latency (color-coded, EWMA-smoothed)
+            ewma = t.latency_ewma
+            if ewma < float("inf"):
+                if ewma < 2.0:
+                    lat = f"{S.GREEN}{ewma:.1f}s{S.RESET}"
+                elif ewma < 5.0:
+                    lat = f"{S.YELLOW}{ewma:.1f}s{S.RESET}"
                 else:
-                    lat = f"{S.RED}{t.latency:.1f}s{S.RESET}"
+                    lat = f"{S.RED}{ewma:.1f}s{S.RESET}"
             else:
                 lat = f"{S.DIM}  -{S.RESET}"
 
@@ -1347,14 +1437,8 @@ class Dashboard:
         out.append(self._row(foot, W))
         out.append(self._hline(W, _BL, _BR))
 
-        # Pad with blank lines to fill the terminal and erase any leftover
-        try:
-            term_h = shutil.get_terminal_size().lines
-        except Exception:
-            term_h = 40
-        drawn = len(out) - 1  # first entry is just the \033[H escape
-        for _ in range(max(0, term_h - drawn - 1)):
-            out.append(" " * W)
+        # Erase any leftover lines from a previous (taller) frame
+        out.append("\033[J")  # ESC[J = erase from cursor to end of screen
 
         sys.stdout.write("\n".join(out) + "\n")
         sys.stdout.flush()
@@ -1395,9 +1479,17 @@ class DnsttBalancer:
         self.listen_host = listen_parts[0]
         self.listen_port = int(listen_parts[1])
 
-        self.socks_server = Socks5Server(self.pool, self.listen_host, self.listen_port)
+        self.socks_server = Socks5Server(
+            self.pool,
+            self.listen_host,
+            self.listen_port,
+            idle_timeout=args.idle_timeout,
+        )
         self.health_monitor = HealthMonitor(
-            self.pool, args.health_interval, args.revive_interval
+            self.pool,
+            args.health_interval,
+            args.revive_interval,
+            recycle_age=args.recycle_age,
         )
 
         self.dashboard: Optional[Dashboard] = None
@@ -1482,15 +1574,23 @@ class DnsttBalancer:
 
         # Wait for shutdown signal
         self._shutdown_event = asyncio.Event()
+        self._force_shutdown = False
         loop = asyncio.get_event_loop()
 
         def _signal_handler():
-            logger.info("Shutdown signal received")
+            if self._shutdown_event.is_set():
+                # Second signal — force kill & exit immediately
+                logger.info("Forced shutdown (second signal)")
+                self._force_shutdown = True
+                self.pool.force_kill_all()
+                # Restore cursor if dashboard was active
+                sys.stdout.write(f"{_S.SHOW_CURSOR}\033[2J\033[H")
+                sys.stdout.flush()
+                os._exit(1)
+            logger.info("Shutdown signal received (press again to force-quit)")
             self._shutdown_event.set()
 
         if IS_WINDOWS:
-            # Windows does not support loop.add_signal_handler; use
-            # signal.signal which works from the main thread.
             signal.signal(signal.SIGINT, lambda s, f: _signal_handler())
             signal.signal(signal.SIGTERM, lambda s, f: _signal_handler())
         else:
@@ -1502,8 +1602,12 @@ class DnsttBalancer:
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
 
-        # ── Graceful shutdown ──
-        await self._shutdown()
+        # ── Graceful shutdown with timeout ──
+        try:
+            await asyncio.wait_for(self._shutdown(), timeout=10.0)
+        except asyncio.TimeoutError:
+            logger.warning("Graceful shutdown timed out, force-killing...")
+            self.pool.force_kill_all()
 
     async def _shutdown(self):
         """Perform graceful shutdown of all components."""
@@ -1681,6 +1785,20 @@ Example:
         help="Dashboard refresh interval in seconds (default: 2.0)",
     )
     p.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=120.0,
+        help="Per-connection idle timeout in seconds (default: 120 = 2min). "
+        "Closes relay if no data flows for this long.",
+    )
+    p.add_argument(
+        "--recycle-age",
+        type=float,
+        default=0,
+        help="Recycle tunnels older than this many seconds (default: 0 = disabled). "
+        "E.g. 3600 to recycle every hour.",
+    )
+    p.add_argument(
         "--no-dashboard",
         action="store_true",
         help="Disable live dashboard (log to stderr instead)",
@@ -1721,7 +1839,7 @@ Example:
                 )
             else:
                 _sp.run(
-                    ["pkill", "-f", "dnstt-client.*127.0.0.1:3"],
+                    ["pkill", "-f", "dnstt-client"],
                     timeout=3,
                     capture_output=True,
                 )
