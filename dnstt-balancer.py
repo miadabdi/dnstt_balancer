@@ -907,11 +907,13 @@ class HealthMonitor:
         interval: float = 30.0,
         revive_interval: float = 300.0,
         recycle_age: float = 0,
+        health_timeout: float = 15.0,
     ):
         self.pool = pool
         self.interval = interval
         self.revive_interval = revive_interval
         self.recycle_age = recycle_age  # 0 = disabled
+        self.health_timeout = health_timeout
         self._task: Optional[asyncio.Task] = None
 
     def start(self):
@@ -930,6 +932,7 @@ class HealthMonitor:
         await asyncio.sleep(min(self.interval, 15))
         last_revive = time.time()
         while True:
+            cycle_start = time.time()
             try:
                 await self._check_all()
 
@@ -956,12 +959,39 @@ class HealthMonitor:
                 return
             except Exception as e:
                 logger.error(f"Health monitor error: {e}")
-            await asyncio.sleep(self.interval)
+            # Sleep for the remainder of the interval, accounting for time
+            # already spent running checks (so the *cycle* period ≈ interval).
+            elapsed = time.time() - cycle_start
+            remaining = self.interval - elapsed
+            if remaining > 0:
+                await asyncio.sleep(remaining)
 
     async def _check_all(self):
         tunnels = list(self.pool.tunnels.values())
-        tasks = [self._check_one(t) for t in tunnels]
+        tasks = [self._check_one_wrapped(t) for t in tunnels]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _check_one_wrapped(self, tunnel: DnsttTunnel):
+        """Run _check_one with an overall timeout so no single probe blocks the cycle."""
+        try:
+            await asyncio.wait_for(self._check_one(tunnel), timeout=self.health_timeout)
+        except asyncio.TimeoutError:
+            tunnel.consecutive_failures += 1
+            tunnel.last_health_check = time.time()
+            if tunnel.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                if tunnel.healthy:
+                    logger.warning(
+                        f"Tunnel #{tunnel.tunnel_id} ({tunnel.dns_server}) "
+                        f"marked unhealthy after {tunnel.consecutive_failures} "
+                        f"failures (health probe timed out)"
+                    )
+                tunnel.healthy = False
+                await self.pool.replace_tunnel(tunnel)
+            else:
+                logger.info(
+                    f"Tunnel #{tunnel.tunnel_id} health probe timed out "
+                    f"({tunnel.consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})"
+                )
 
     async def _recycle_old_tunnels(self):
         """Replace tunnels that have exceeded recycle_age seconds."""
@@ -1033,7 +1063,7 @@ class HealthMonitor:
             await writer.drain()
 
             # Read CONNECT reply header (VER, REP, RSV)
-            reply_hdr = await asyncio.wait_for(reader.readexactly(3), timeout=45)
+            reply_hdr = await asyncio.wait_for(reader.readexactly(3), timeout=20)
             ver, rep, rsv = reply_hdr
 
             # Read and discard bound address
@@ -1490,6 +1520,7 @@ class DnsttBalancer:
             args.health_interval,
             args.revive_interval,
             recycle_age=args.recycle_age,
+            health_timeout=args.health_timeout,
         )
 
         self.dashboard: Optional[Dashboard] = None
@@ -1771,9 +1802,16 @@ Example:
         help="Health check interval in seconds (default: 30.0)",
     )
     p.add_argument(
+        "--health-timeout",
+        type=float,
+        default=15.0,
+        help="Max seconds for a single health probe before it's considered failed "
+        "(default: 15.0). Should be less than --health-interval.",
+    )
+    p.add_argument(
         "--revive-interval",
         type=float,
-        default=300.0,
+        default=600.0,
         help="Seconds between retrying dead resolvers (default: 300 = 5min)",
     )
     p.add_argument(
