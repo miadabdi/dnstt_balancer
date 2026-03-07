@@ -61,7 +61,7 @@ SOCKS5_REP_REFUSED = 0x05
 SOCKS5_REP_CMD_NOT_SUPPORTED = 0x07
 
 RELAY_BUF = 65536  # 64KB relay buffer
-HEALTH_TARGET_HOST = "www.gstatic.com"
+HEALTH_TARGET_HOST = "www.google.com"
 HEALTH_TARGET_PORT = 443
 MAX_CONSECUTIVE_FAILURES = 3
 MAX_RETRIES = 2  # retry on different tunnel if upstream connect fails

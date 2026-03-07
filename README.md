@@ -1,5 +1,7 @@
 # dnstt-balancer
 
+English | [فارسی](README.fa.md)
+
 Multi-tunnel SOCKS5 load balancer for [dnstt-client](https://www.bamsoftware.com/software/dnstt/).
 
 Spawns multiple `dnstt-client` processes (one per DNS resolver), exposes a single unified SOCKS5 proxy, and distributes connections across healthy tunnels using latency-weighted routing — with automatic health monitoring, dead-resolver revival, retry on failure, and a live terminal dashboard.
@@ -10,6 +12,8 @@ Spawns multiple `dnstt-client` processes (one per DNS resolver), exposes a singl
 - **Latency-weighted routing** — faster tunnels get more connections automatically
 - **Health monitoring** — periodic SOCKS5 CONNECT probes detect dead tunnels and replace them from a reserve pool
 - **Dead-resolver revival** — resolvers that previously failed are periodically retried so the pool doesn't shrink over time
+- **Idle-stall protection** — per-connection inactivity timeout closes stuck relays so clients can reconnect through healthy tunnels
+- **Tunnel recycling** — optional max-age replacement keeps long-lived tunnels fresh
 - **Automatic retry** — if a connection fails through one tunnel, it transparently retries on a different one
 - **Live TUI dashboard** — color-coded, box-drawing terminal UI showing tunnel health, latency, throughput rates, and recent events
 - **Cross-platform** — works on Linux, macOS, and Windows
@@ -62,7 +66,7 @@ Plain text, one resolver IP per line. Comments (`#`) and blank lines are ignored
 
 | Flag                       | Default                      | Description                                                |
 | -------------------------- | ---------------------------- | ---------------------------------------------------------- |
-| `--dnstt PATH`             | `./dnstt-client-linux-amd64` | Path to `dnstt-client` binary (auto-detected per platform) |
+| `--dnstt PATH`             | platform-specific auto default | Path to `dnstt-client` binary (auto-detected per platform) |
 | `--dns-list FILE`          | _(required)_                 | Text file with DNS resolver IPs                            |
 | `--pubkey KEY`             | _(required)_                 | dnstt server public key                                    |
 | `--domain DOMAIN`          | _(required)_                 | dnstt domain                                               |
@@ -73,8 +77,11 @@ Plain text, one resolver IP per line. Comments (`#`) and blank lines are ignored
 | `--max-tunnels N`          | `15`                         | Maximum concurrent tunnels                                 |
 | `--startup-wait SECS`      | `6.0`                        | Seconds to wait for each tunnel to start                   |
 | `--health-interval SECS`   | `30.0`                       | Health check interval                                      |
-| `--revive-interval SECS`   | `300.0`                      | Seconds between retrying dead resolvers                    |
-| `--stats-interval SECS`    | `5.0`                        | Dashboard refresh interval                                 |
+| `--health-timeout SECS`    | `15.0`                       | Max duration of a single health probe before timeout       |
+| `--revive-interval SECS`   | `600.0`                      | Seconds between retrying dead resolvers                    |
+| `--tui-interval SECS` / `--stats-interval SECS` | `2.0` | Dashboard refresh interval                                 |
+| `--idle-timeout SECS`      | `120.0`                      | Per-connection idle timeout for relay traffic              |
+| `--recycle-age SECS`       | `0`                          | Recycle tunnels older than this age (`0` disables)         |
 | `--no-dashboard`           | _(off)_                      | Disable live TUI, log to stderr instead                    |
 | `--log-file PATH`          | _(none)_                     | Log to file (recommended alongside dashboard)              |
 
@@ -113,17 +120,32 @@ python3 dnstt-balancer.py \
     --log-file balancer.log
 ```
 
+Enable tunnel recycling and a stricter idle timeout:
+
+```bash
+python3 dnstt-balancer.py \
+    --dns-list dns.txt \
+    --pubkey <KEY> \
+    --domain t.example.com \
+    --recycle-age 3600 \
+    --idle-timeout 60
+```
+
 ## How It Works
 
-1. **Startup** — reads the DNS list, shuffles it, and spawns up to `--max-tunnels` `dnstt-client` processes in parallel. Each gets a unique local SOCKS5 port (starting at 30000).
+1. **Startup** — reads the DNS list, shuffles it, and spawns up to `--max-tunnels` `dnstt-client` processes in parallel. Each tunnel gets a unique ephemeral local SOCKS5 port chosen by the OS.
 
 2. **Proxy** — listens for incoming SOCKS5 connections on the `--listen` address. Each connection is routed to the best available tunnel (weighted by latency and current load). If the upstream connect fails, it retries on a different tunnel (up to 2 retries).
 
-3. **Health checks** — every `--health-interval` seconds, each tunnel is probed with a SOCKS5 CONNECT to `www.gstatic.com:443`. Tunnels that fail 3 consecutive checks are marked unhealthy and replaced from the reserve pool.
+3. **Health checks** — every `--health-interval` seconds, each tunnel is probed with a SOCKS5 CONNECT to `www.google.com:443` (bounded by `--health-timeout`). Tunnels that fail 3 consecutive checks are marked unhealthy and replaced from the reserve pool.
 
 4. **Dead-resolver revival** — every `--revive-interval` seconds, previously dead resolvers are moved back into the reserve pool and retried, preventing permanent pool shrinkage.
 
-5. **Shutdown** — Ctrl+C triggers graceful shutdown: stops accepting new connections, waits up to 5 seconds for active connections to drain, kills all `dnstt-client` processes, and prints final statistics.
+5. **Relay stall handling** — each connection relay tracks activity in both directions. If no data flows for `--idle-timeout`, that relay is closed.
+
+6. **Optional tunnel recycling** — if `--recycle-age` is set to a positive value, idle tunnels older than that age are replaced.
+
+7. **Shutdown** — Ctrl+C triggers graceful shutdown: stops accepting new connections, waits briefly for active connections to drain, kills all `dnstt-client` processes, and prints final statistics. Sending Ctrl+C again force-quits immediately.
 
 ## Project Structure
 
