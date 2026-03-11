@@ -166,6 +166,7 @@ class TunnelPool:
         self.dead_resolvers: Set[str] = set()
 
         self.tunnels: Dict[int, DnsttTunnel] = {}
+        self._live_procs: Set[subprocess.Popen] = set()
         self._next_id = 0
         self._lock = asyncio.Lock()
 
@@ -228,6 +229,7 @@ class TunnelPool:
             else:
                 popen_kwargs["preexec_fn"] = os.setsid
             proc = subprocess.Popen(cmd, **popen_kwargs)
+            self._live_procs.add(proc)
         except Exception as e:
             logger.error(f"Failed to spawn tunnel #{tunnel_id} via {dns_server}: {e}")
             return None
@@ -239,6 +241,7 @@ class TunnelPool:
         )
 
         if proc.poll() is not None:
+            self._live_procs.discard(proc)
             logger.warning(f"Tunnel #{tunnel_id} ({dns_server}) died during startup")
             try:
                 stderr_file.seek(0)
@@ -272,6 +275,9 @@ class TunnelPool:
 
     def _kill_process(self, proc: subprocess.Popen):
         """Terminate a process tree, escalating as needed."""
+        if proc.poll() is not None:
+            self._live_procs.discard(proc)
+            return
         if IS_WINDOWS:
             # On Windows, kill the entire process tree with taskkill /T
             try:
@@ -300,6 +306,7 @@ class TunnelPool:
                     proc.wait(timeout=2)
                 except Exception:
                     pass
+        self._live_procs.discard(proc)
 
     async def spawn_all(self):
         """Spawn all initial tunnels concurrently."""
@@ -377,6 +384,8 @@ class TunnelPool:
 
             if tunnel.process and tunnel.is_alive():
                 self._kill_process(tunnel.process)
+            elif tunnel.process:
+                self._live_procs.discard(tunnel.process)
 
             self.dead_resolvers.add(tunnel.dns_server)
             del self.tunnels[tunnel.tunnel_id]
@@ -457,11 +466,9 @@ class TunnelPool:
         """Kill all dnstt-client processes (in parallel via thread pool)."""
         loop = asyncio.get_event_loop()
         tasks = []
-        for tunnel in list(self.tunnels.values()):
-            if tunnel.process and tunnel.is_alive():
-                tasks.append(
-                    loop.run_in_executor(None, self._kill_process, tunnel.process)
-                )
+        for proc in list(self._live_procs):
+            if proc.poll() is None:
+                tasks.append(loop.run_in_executor(None, self._kill_process, proc))
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         for tunnel in list(self.tunnels.values()):
@@ -469,17 +476,15 @@ class TunnelPool:
                 os.unlink(tunnel.stderr_path)
             except Exception:
                 pass
+        self._live_procs.clear()
         self.tunnels.clear()
         logger.info("All tunnels stopped")
 
     def force_kill_all(self):
         """Synchronous best-effort kill of every tunnel process (no waiting)."""
-        for tunnel in list(self.tunnels.values()):
-            try:
-                if tunnel.process and tunnel.process.poll() is None:
-                    tunnel.process.kill()
-            except Exception:
-                pass
+        for proc in list(self._live_procs):
+            self._kill_process(proc)
+        self._live_procs.clear()
         self.tunnels.clear()
 
 
@@ -1860,12 +1865,19 @@ Example:
         )
         sys.exit(1)
 
+    balancer = DnsttBalancer(args)
+
     try:
-        asyncio.run(DnsttBalancer(args).run())
+        asyncio.run(balancer.run())
     except KeyboardInterrupt:
         # Final fallback: force-kill any remaining dnstt processes
         print("\nForce shutdown...")
         import subprocess as _sp
+
+        try:
+            balancer.pool.force_kill_all()
+        except Exception:
+            pass
 
         try:
             if IS_WINDOWS:
